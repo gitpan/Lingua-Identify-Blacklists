@@ -20,9 +20,12 @@ no_index:
     - share
     - t
 requires:
-  FindBin: 0
-  Getopt::Std: 0
+  File::Basename: 0
+  File::GetLineMaxLength: 0
+  File::ShareDir: 0
+  Lingua::Identify: 0
+  Lingua::Identify::CLD: 0.05
   perl: 5.8.0
 resources:
   license: http://opensource.org/licenses/lgpl-license.php
-version: 0.02
+version: 0.03

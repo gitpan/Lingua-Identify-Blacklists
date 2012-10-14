@@ -7,15 +7,18 @@ use strict;
 
 use File::ShareDir qw/dist_dir/;
 use File::Basename qw/dirname/;
+use File::GetLineMaxLength;
 
+use Lingua::Identify qw(:language_identification);;
+use Lingua::Identify::CLD;
 
 use Exporter 'import';
-our @EXPORT = qw( identify identify_file identify_stdin 
-                  train train_blacklist run_experiment 
-                   available_languages available_blacklists );
-our %EXPORT_TAGS = ( all => \@EXPORT );
+our @EXPORT_OK = qw( identify identify_file identify_stdin 
+                     train train_blacklist run_experiment 
+                     available_languages available_blacklists );
+our %EXPORT_TAGS = ( all => \@EXPORT_OK );
 
-our $VERSION = '0.02';
+our $VERSION = '0.03';
 
 =encoding UTF-8
 
@@ -25,7 +28,7 @@ Lingua::Identify::Blacklists - Language identification for related languages bas
 
 =head1 VERSION
 
-Version 0.02
+Version 0.03
 
 =head1 SYNOPSIS
 
@@ -36,14 +39,21 @@ Version 0.02
   my $lang = identify( ".... text to be classified ...", 
                        langs => ['bs','hr','sr']);
 
-  # use all languages available
+  # check if the assumed language ('hr') is confused with another one
+  my $lang = identify( ".... text to be classified ...", assumed => 'hr' );
+
+  # use a general-purpose identfier and check confusable langauges if necessary
   my $lang = identify( ".... text to be classified ...");
 
   # delect language in the given file (Unicode UTF-8 is assumed)
+  my $lang = identify_file( $filename, langs => [...] );
+  my $lang = identify_file( $filename, assumed => '..' );
   my $lang = identify_file( $filename );
 
   # delect language for every line separately from the given file 
   # (return a list of lang-IDs)
+  my @langs = identify_file( $filename, every_line => 1, langs = [...] );
+  my @langs = identify_file( $filename, every_line => 1, assumed = '..' );
   my @langs = identify_file( $filename, every_line => 1 );
 
 
@@ -72,17 +82,24 @@ Version 0.02
 
   train( { cs => $file_with_cs_text, sk => $file_with_sk_text }, %para );
 
+=head1 Description
+
+This module adds a blacklist classifier to a general purpose language identification tool. Related languages can easily be confused with each other and standard language detection tools do not work very well for distinguishing them. With this module one can train so-called blacklists of words for language pairs containing words that should not (or very rarely) occur in one language while being quite common in the other. These blacklists are then used to discriminate between those "confusable" related languages.
+
+Since version 0.03 it also integrates a standard language identifier (Lingua::Identify::CLD) and can now be used for general language identification. It calls the blacklist classifier only for those languages that can be confused and for which appropriate blacklists are trained.
 
 
 =head1 Settings
 
 Module-internal variables that can be modified:
 
- $BLACKLISTDIR   directory with all blacklists (default: module-share-dir)
- $LOWERCASE      lowercase all data, yes/no (1/0), default: 1
- $TOKENIZE       tokenize all data, yes/no (1/0), default: 1
- $ALPHA_ONLY     don't use tokens with non-alphabetic characters, default: 1
- $VERBOSE        verbose output (default=0)
+ $BLACKLISTDIR     directory with all blacklists (default: module-share-dir)
+ $LOWERCASE        lowercase all data, yes/no (1/0), default: 1
+ $TOKENIZE         tokenize all data, yes/no (1/0), default: 1
+ $ALPHA_ONLY       don't use tokens with non-alphabetic characters, default: 1
+ $MAX_LINE_LENGTH  max line length when reading from files (default=2**16)
+ $CLD_TEXT_SIZE    text size in characters used for language ident. with CLD
+ $VERBOSE          verbose output (default=0)
 
 Tokenization is very simple and replaces all non-alphabetic characters with a white-space character.
 
@@ -92,27 +109,41 @@ Tokenization is very simple and replaces all non-alphabetic characters with a wh
 our $BLACKLISTDIR;
 eval{ $BLACKLISTDIR = &dist_dir('Lingua-Identify-Blacklists') . '/blacklists' };
 
-our $LOWERCASE = 1;
-our $TOKENIZE = 1;
-our $ALPHA_ONLY = 1;
+our $LOWERCASE       = 1;
+our $TOKENIZE        = 1;
+our $ALPHA_ONLY      = 1;
+our $MAX_LINE_LENGTH = 2**16;    # limit the length of one line to be read
+our $CLD_TEXT_SIZE   = 2**16;    # text size used for detecting lang with CLD
+our $VERBOSE         = 0;
 
-my %blacklists = ();
+my %blacklists = ();  # hash of blacklists (langpair => {blacklist}, ...)
+my %confusable = ();  # hash of confusable languages (lang => [other_langs])
 
-our $VERBOSE = 0;
+## the compact language identifier from Google Chrome
+my $CLD = new Lingua::Identify::CLD;
+
+
+# load all blacklists in the gneral BLACKLISTDIR
+&load_blacklists( $BLACKLISTDIR );
 
 
 
-
-sub initialize{ %blacklists = (); }
 
 =head1 Exported Functions
 
-=head2 C<$langID = identify( $text[,%options] )>
+=head2 C<$langID = identify( $text [,%options] )>
 
 Analyses a given text and returns a language ID as the result of the classification. C<%options> can be used to change the behaviour of the classifier. Possible options are
 
-  langs => \@list_of_possible_langs
+  assumed    => $assumed_lang
+  langs      => \@list_of_possible_langs
   use_margin => $score
+
+If C<langs> are specified, it runs the classifier with blacklists for those languages (in a cascaded way, i.e. best1 = lang1 vs lang2, best2 = best1 vs lang3, ...). If C<use_margin> is specified, it runs all versus all and returns the language that wins the most (with margin=$score).
+
+If the C<assumed> language is given, it runs the blacklist classifier for all languages that can be confused with $assumed_lang (if blacklist models exist for them).
+
+If neither C<langs> not C<assumed> are specified, it first runs a general-purpose language identification (using Lingua::Identify::CLD and Lingua::Identify) and then checks with the blacklist classifier whether the detected language can be confused with another one. For example, CLD frequently classifies Serbian and Bosnian texts as Croatian but the blacklist classifier will detect that (and hopefully correct the decision).
 
 =cut
 
@@ -123,17 +154,31 @@ sub identify{
   my %dic = ();
   my $total = 0;
 
-  &process_string( $text, \%dic, $total );
-  return &classify( \%dic, %options );
+  # run the blacklist classifier if 'langs' are specified
+  if (exists $options{langs}){
+      &process_string( $text, \%dic, $total );
+      return &classify( \%dic, %options );
+  }
+
+  # otherwise: check if there is an 'assumed' language
+  # if not: classify with CLD
+  $options{assumed} = &identify_language( $text ) 
+      unless (exists $options{assumed});
+
+  # if there is an 'assumed' language:
+  # check if it can be confused with others (i.e. blacklists exist)
+  if (exists $confusable{$options{assumed}}){
+      $options{langs} = $confusable{$options{assumed}};
+      # finally: process the text and classify
+      &process_string( $text, \%dic, $total );
+      return &classify( \%dic, %options );
+  }
+  return $options{assumed};
 }
 
 
-sub identify_stdin{
-    return identify_file( undef, @_ );
-}
 
-
-=head2 C<$langID = identify_file( $filename[,%options] )>
+=head2 C<$langID = identify_file( $filename [,%options] )>
 
 Does the same as C<identify> but reads text from a file. It also takes the same options as the 'identify' function but allows two extra options:
 
@@ -156,40 +201,85 @@ sub identify_file{
     my $total = 0;
     my @predictions = ();
     
-    my $fh = *STDIN;
-    if (defined $file){
-	if (-e $file){
-	    open $fh,"<$file" || die "cannot read from '$file'\n";
-	    binmode($fh,":encoding(UTF-8)");
+    my $fh     = defined $file ? open_file($file) : *STDIN;
+    my $reader = File::GetLineMaxLength->new($fh);
+
+    # mode 1: classify every line separately
+    if ($options{every_line}){
+	my @predictions = ();
+	while (my $line = $reader->getline($MAX_LINE_LENGTH)) {
+	    chomp $line;
+            push( @predictions, &identify( $line, %options ) );
 	}
-	else{ print STDERR "Cannot find file '$file'! Read from STDIN\n"; }
+	return @predictions;
     }
-    
-    while (<$fh>){
-	chomp;
-	&process_string($_,\%dic,$total);
-	if ($options{every_line}){                        # classify every line separately
-            push( @predictions, &classify( \%dic, %options ) );
-            %dic=();
+
+    # mode 2: classify all text together (optional: size limit)
+    my $text = '';
+    while (my $line = $reader->getline($MAX_LINE_LENGTH)) {
+
+	# save text if no languages are given (for blacklists)
+	unless (exists $options{langs} || exists $options{assumed}){
+	    if ( length($text) < $CLD_TEXT_SIZE ){
+		$text .= $line;
+	    }
 	}
-	elsif ($options{text_size}){                     # use only a certain number of words
+
+	# prepare the data for blacklist classification
+	# (TODO: we do not run blacklists all the time - 
+	#        schould we process the text later when needed?)
+	chomp $line;
+	&process_string($line,\%dic,$total);
+	if ($options{text_size}){        # use only a certain number of words
 	    if ($total > $options{text_size}){
-		print STDERR "use $total tokens for classification\n" if ($VERBOSE);
+		print STDERR "use $total tokens for classification\n" 
+		    if ($VERBOSE);
 		last;
 	    }
 	}
     }
-    unless ($options{every_line}){
-	push( @predictions, &classify( \%dic, %options ) );
+
+    # no languages selected?
+    unless (exists $options{langs}){
+	# no assumed language set
+	unless (exists $options{assumed}){
+	    # try to identify with the text we have saved above
+	    $options{assumed} = &identify_language( $text ) 
+		unless (exists $options{assumed});
+	}
+	if (exists $confusable{$options{assumed}}){
+	    $options{langs} = $confusable{$options{assumed}};
+	}
     }
-    return wantarray ? @predictions : $predictions[0];
+
+    # finally: classify with blacklists
+    if (exists $options{langs}){
+	# finally: process the text and classify
+	&process_string( $text, \%dic, $total );
+	return &classify( \%dic, %options );
+    }
+
+    # no blacklists in this case ...
+    return $options{assumed};
+}
+
+
+
+=head2 C<$langID = identify_stdin( [,%options] )>
+
+The same as C<identify_file> but reads from STDIN
+
+=cut
+
+
+sub identify_stdin{
+    return identify_file( undef, @_ );
 }
 
 
 
 
-
-=head2 C<train(\%traindata[,%options])>
+=head2 C<train( \%traindata [,%options] )>
 
 Trains classifiers by learning blacklisted words for pairwise language discrimination. Returns nothing. Blacklists are stored in C<Lingua::Identify::Blacklists::BLACKLISTDIR/>. You may have to run the process as administrator if you don't have write permissions.
 
@@ -227,7 +317,7 @@ sub train{
 }
 
 
-=head2 C<train_blacklist($file1,$file2,%options)>
+=head2 C<train_blacklist( $file1, $file2, %options )>
 
 This function learns a blacklist of words to discriminate between the language given in $file1 and the language given in $file2. It takes the same arguments (%options) as the C<train> function above with one additional parameter:
 
@@ -306,7 +396,7 @@ Returns a list of languages covered by the blacklists in the BLACKLISTDIR.
 
 sub available_languages{
     unless (keys %blacklists){
-	&load_all_blacklists( $BLACKLISTDIR );
+	&load_blacklists( $BLACKLISTDIR );
     }
     my %langs = ();
     foreach (keys %blacklists){
@@ -318,22 +408,27 @@ sub available_languages{
 }
 
 
-=head2 C<@langs = available_blacklists()>
+=head2 C<%lists = available_blacklists()>
 
 Resturns a hash of available language pairs (for which blacklists exist in the system).
+
+ %lists = ( srclang1 => { trglang1a => blacklist1a, trglang1b => blacklist1b },
+            srclang2 => { trglang2a => blacklist2a, ... }
+            .... )
 
 =cut
 
 
 sub available_blacklists{
     unless (keys %blacklists){
-	&load_all_blacklists( $BLACKLISTDIR );
+	&load_blacklists( $BLACKLISTDIR );
     }
     my %pairs = ();
     foreach (keys %blacklists){
 	my ($lang1,$lang2) = split(/\-/);
-	$pairs{$lang1}{$lang2} = 1;
-	$pairs{$lang2}{$lang1} = 1;
+	$pairs{$lang1}{$lang2} = $_;
+	$pairs{$lang2}{$lang1} = $_ 
+	    unless (defined $pairs{$lang2} && defined $pairs{$lang2}{$lang1});
     }
     return %pairs;
 }
@@ -341,7 +436,7 @@ sub available_blacklists{
 
 
 
-=head2 C<run_experiment(\@trainfiles,\@testfiles,\%options,@langs)>
+=head2 C<run_experiment( \@trainfiles, \@testfiles, \%options, @langs )>
 
 This function allows to run experiments, i.e. training and evaluating classifiers for the given languages (C<@langs>). The arrays of training data and test data need to be of the same size as C<@langs>. The function prints the overall accurcy and a confusion table given the data sets and the classification. C<%options> can be used to set classifier-specific parameters.
 
@@ -356,8 +451,10 @@ sub run_experiment{
     my $evalfiles = shift;
     my $options = ref($_[0]) eq 'HASH' ? shift : {};
 
-    my @traindata = ref($trainfiles) eq 'ARRAY' ? @{$trainfiles} : split(/\s+/,$trainfiles);
-    my @evaldata = ref($evalfiles) eq 'ARRAY' ? @{$evalfiles} : split(/\s+/,$evalfiles);
+    my @traindata = 
+	ref($trainfiles) eq 'ARRAY' ? @{$trainfiles} : split(/\s+/,$trainfiles);
+    my @evaldata = 
+	ref($evalfiles) eq 'ARRAY' ? @{$evalfiles} : split(/\s+/,$evalfiles);
     my @langs = @_;
 
     die "no languages given!\n" unless (@langs);
@@ -434,22 +531,38 @@ sub run_experiment{
 
 The following functions are not exported and are mainly used for internal purposes (but may be used from the outside if needed).
 
- classify(\%dic,%options)          # run the classifier
- classify_cascaded(\%dic,@langs)   # run a cascade of binary classifications
+ initialize()                     # reset the repository of blacklists
+ identify_language($text)         # return lang-ID for $text (using CLD)
+ classify(\%dic,%options)         # run the classifier
+ classify_cascaded(\%dic,@langs)  # run a cascade of binary classifications
 
  # run all versus all and return the one that wins most binary decisions
  # (a score margin is used to adjust the reliability of the decisions)
+
  classify_with_margin(\%dic,$margin,@langs) 
 
- load_all_blacklists()        # load all blacklists available in BLACKLISTDIR
- load_blacklist(\%list,$dir,$lang1,$lang2) # load a lang-pair specific blacklist
- read_file($file,\%dic,$max)  # read a file and count token frequencies
- process_string($string)      # process a given string (lowercasing ...)
+ load_blacklists($dir)                # load all blacklists available in $dir
+ load_blacklist(\%list,$dir,      # load a lang-pair specific blacklist
+                $lang1,$lang2)  
+ read_file($file,\%dic,$max)      # read a file and count token frequencies
+ process_string($string)          # process a given string (lowercasing ...)
 
 =cut
 
 
+sub initialize{ %blacklists = (); %confusable = (); }
 
+sub identify_language{
+    my ($lang, $id, $conf) = $CLD->identify( $_[0] );
+
+    # strangely enough CLD is not really reliable for English
+    # (all kinds of garbish input is recognized as English)
+    # --> check with Lingua::Identify
+    if ($id eq 'en'){
+	$id = $id = langof( $_[0] ) ? $id : 'unknown';
+    }
+    return $id;
+}
 
 sub classify{
     my $dic         = shift;
@@ -465,10 +578,6 @@ sub classify{
 	if ($options{use_margin});
     return &classify_cascaded( $dic, @langs );
 }
-
-
-
-
 
 sub classify_cascaded{
     my $dic = shift;
@@ -548,13 +657,12 @@ sub classify_with_margin{
 }
 
 
+# load_all_blacklists = alias for load_blacklists
 
+sub load_all_blacklists{ return load_blacklists(@_); }
 
-
-
-
-sub load_all_blacklists{
-    my $dir = shift;
+sub load_blacklists{
+    my $dir = shift || $BLACKLISTDIR;
 
     opendir(my $dh, $dir) || die "cannot read directory '$dir'\n";
     while(readdir $dh) {
@@ -564,6 +672,13 @@ sub load_all_blacklists{
 	}
     }
     closedir $dh;
+
+    # update list of confusable languages
+    my %lists = &available_blacklists();
+    foreach my $lang (keys %lists){
+	@{$confusable{$lang}} = keys %{$lists{$lang}};
+	unshift( @{$confusable{$lang}}, $lang );
+    }
 }
 
 
@@ -585,24 +700,32 @@ sub load_blacklist{
     close F;
 }
 
-
-
-
-
+sub open_file{
+    my $file = shift;
+    # allow gzipped input
+    my $fh;
+    if ($file=~/\.gz$/){
+	open $fh,"gzip -cd < $file |" || die "cannot open file '$file'";
+	binmode($fh,":encoding(UTF-8)");
+    }
+    else{
+	open $fh,"<:encoding(UTF-8)",$file || die "cannot open file '$file'";
+    }
+    return $fh;
+}
 
 sub read_file{
     my ($file,$dic,$max)=@_;
+
+    # use File::GetLineMaxLength to avoid filling the memory
+    # when reading from files without new lines
+    my $fh     = open_file( $file );
+    my $reader = File::GetLineMaxLength->new($fh);
+
     my $total = 0;
-    if ($file=~/\.gz$/){
-	open F,"gzip -cd < $file |" || die "...";
-	binmode(F,":encoding(UTF-8)");
-    }
-    else{
-	open F,"<:encoding(UTF-8)",$file || die "...";
-    }
-    while (<F>){
-	chomp;
-        &process_string($_,$dic,$total);
+    while (my $line = $reader->getline($MAX_LINE_LENGTH)) {
+	chomp $line;
+        &process_string($line,$dic,$total);
         if ($max){
             if ($total > $max){
                 print STDERR "read $total tokens from $file\n";
@@ -610,11 +733,9 @@ sub read_file{
             }
         }
     }
-    close F;
+    close $fh;
     return $total;
 }
-
-
 
 
 # process_string($string,\%dic,\$wordcount)
@@ -630,13 +751,7 @@ sub process_string{
     foreach my $w (@words){${$_[1]}{$w}++;$_[2]++;}
 }
 
-
-
-
-
-
 1;
-
 
 __END__
 
@@ -657,6 +772,10 @@ make changes.
 You can find documentation for this module with the perldoc command.
 
     perldoc Lingua::Identify::Blacklists
+
+=head1 SEE ALSO
+
+This module is designed for the discrimination between closely related languages. For general-purpose language identification look at L<Lingua::Identify>, L<Lingua::Identify::CLD> and L<Lingua::Ident>
 
 =head1 LICENSE AND COPYRIGHT
 

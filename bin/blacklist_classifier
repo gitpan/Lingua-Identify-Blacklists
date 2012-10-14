@@ -1,6 +1,9 @@
 #!/usr/bin/env perl
 #-*-perl-*-
 
+
+=encoding UTF-8
+
 =head1 USAGE
 
 =head2 Classification:

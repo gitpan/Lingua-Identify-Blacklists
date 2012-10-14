@@ -4,3 +4,8 @@
 
 0.02	Sat Oct 13 09:57:20 CEST 2012
 	- now with documentation
+
+0.03	Sun Oct 14 18:50:20 CEST 2012
+	- read from files with line-length-limit
+	- integrated general-purpose language identifier (Lingua::Identify::CLD)
+
