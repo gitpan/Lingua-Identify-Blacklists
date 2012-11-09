@@ -36,7 +36,7 @@
  -c <score> ..... min difference score to be relevant
  -d <dir> ....... directory of black lists
  -i ............. classify each line separately
- -m <number> .... use approximately <number> tokens to traing/classify
+ -m <number> .... use approximately <number> tokens to train/classify
  -n ............. train a new black list
  -v ............. verbose mode
 
@@ -80,6 +80,10 @@ my %options = ( text_size => $opt_m,
 		min_diff => $min_diff );
 
 
+if ($opt_v){
+    print "use blacklists in $Lingua::Identify::Blacklists::BLACKLISTDIR\n";
+}
+
 # run experiments with a given set of training corpora and 
 # a set of evaluation corpora
 
@@ -121,7 +125,9 @@ elsif ($opt_n){
 else{
     my @langs = @ARGV;
     @ARGV = ();
-    my @predictions = &identify_stdin( langs => \@langs, every_line => $opt_i );
+    my @predictions = &identify_stdin( langs => \@langs, 
+				       every_line => $opt_i,
+				       %options );
     print join("\n",@predictions);
     print "\n";
 }

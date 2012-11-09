@@ -28,4 +28,4 @@ requires:
   perl: 5.8.0
 resources:
   license: http://opensource.org/licenses/lgpl-license.php
-version: 0.03
+version: 0.04

@@ -9,3 +9,5 @@
 	- read from files with line-length-limit
 	- integrated general-purpose language identifier (Lingua::Identify::CLD)
 
+0.04
+	- fixed a bug in identify file (classification was based on 64k only)

@@ -18,7 +18,7 @@ our @EXPORT_OK = qw( identify identify_file identify_stdin
                      available_languages available_blacklists );
 our %EXPORT_TAGS = ( all => \@EXPORT_OK );
 
-our $VERSION = '0.03';
+our $VERSION = '0.04';
 
 =encoding UTF-8
 
@@ -93,13 +93,13 @@ Since version 0.03 it also integrates a standard language identifier (Lingua::Id
 
 Module-internal variables that can be modified:
 
- $BLACKLISTDIR     directory with all blacklists (default: module-share-dir)
- $LOWERCASE        lowercase all data, yes/no (1/0), default: 1
- $TOKENIZE         tokenize all data, yes/no (1/0), default: 1
- $ALPHA_ONLY       don't use tokens with non-alphabetic characters, default: 1
- $MAX_LINE_LENGTH  max line length when reading from files (default=2**16)
- $CLD_TEXT_SIZE    text size in characters used for language ident. with CLD
- $VERBOSE          verbose output (default=0)
+ $BLACKLISTDIR     # directory with all blacklists (default: module-share-dir)
+ $LOWERCASE        # lowercase all data, yes/no (1/0), default: 1
+ $TOKENIZE         # tokenize all data, yes/no (1/0), default: 1
+ $ALPHA_ONLY       # don't use tokens with non-alphabetic characters, default: 1
+ $MAX_LINE_LENGTH  # max line length when reading from files (default=2**16)
+ $CLD_TEXT_SIZE    # text size in characters used for language ident. with CLD
+ $VERBOSE          # verbose output (default=0)
 
 Tokenization is very simple and replaces all non-alphabetic characters with a white-space character.
 
@@ -156,7 +156,7 @@ sub identify{
 
   # run the blacklist classifier if 'langs' are specified
   if (exists $options{langs}){
-      &process_string( $text, \%dic, $total );
+      &process_string( $text, \%dic, $total, $options{text_size} );
       return &classify( \%dic, %options );
   }
 
@@ -226,8 +226,8 @@ sub identify_file{
 	}
 
 	# prepare the data for blacklist classification
-	# (TODO: we do not run blacklists all the time - 
-	#        schould we process the text later when needed?)
+	# (TODO: is this cheaper than keeping the text in memory and
+	#        processing it later when needed?)
 	chomp $line;
 	&process_string($line,\%dic,$total);
 	if ($options{text_size}){        # use only a certain number of words
@@ -254,8 +254,6 @@ sub identify_file{
 
     # finally: classify with blacklists
     if (exists $options{langs}){
-	# finally: process the text and classify
-	&process_string( $text, \%dic, $total );
 	return &classify( \%dic, %options );
     }
 
@@ -308,10 +306,11 @@ sub train{
 
     for my $s (0..$#langs){
         for my $t ($s+1..$#langs){
-            print "traing blacklist for $langs[$s]-$langs[$t]\n";
+            print "traing blacklist for $langs[$s]-$langs[$t] ... ";
             &train_blacklist( $$traindata{$langs[$s]},$$traindata{$langs[$t]},
 		    outfile  => "$BLACKLISTDIR/$langs[$s]-$langs[$t].txt",
 		    %options );
+            print "saved in '$BLACKLISTDIR/$langs[$s]-$langs[$t].txt'\n";
         }
     }
 }
@@ -738,7 +737,7 @@ sub read_file{
 }
 
 
-# process_string($string,\%dic,\$wordcount)
+# process_string($string,\%dic,\$wordcount[,$maxwords])
 
 sub process_string{
     $_[0]=lc($_[0]) if ($LOWERCASE);
@@ -747,6 +746,9 @@ sub process_string{
     my @words = $ALPHA_ONLY ? 
         grep(/^\p{IsAlpha}/,split(/\s+/,$_[0])) :
         split(/\s+/,$_[0]);
+
+    # use only $maxwords words
+    splice(@words,$_[3]) if ($_[3]);
 
     foreach my $w (@words){${$_[1]}{$w}++;$_[2]++;}
 }
